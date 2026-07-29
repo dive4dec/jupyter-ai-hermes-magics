@@ -611,7 +611,10 @@ class HermesMagics(Magics):
             if cmd == "version":
                 print(f"jupyter-ai-hermes-magics v{__version__}")
                 return
-            print(f"Unknown subcommand: {cmd}. Use: reset, list, version")
+            if cmd == "help":
+                self._print_help()
+                return
+            print(f"Unknown subcommand: {cmd}. Use: %hermes help, list, reset, version")
             return
 
         # ── Cell magic ──
@@ -753,6 +756,119 @@ class HermesMagics(Magics):
         # Also reset ACP connection
         AcpConnection.reset_instance()
         print("✅ All sessions cleared. Next %%hermes will start fresh.")
+
+    def _print_help(self) -> None:
+        """Print comprehensive help for %hermes and %%hermes."""
+        from textwrap import dedent
+
+        tree = self._get_session_tree()
+        labels = tree.list_labels()
+
+        # Build session tree display
+        if labels:
+            tree_lines = []
+            for label_name in labels:
+                node = tree.get(label_name)
+                if node is None:
+                    continue
+                depth = 0 if label_name == tree.root_label else label_name.count(".")
+                indent = "    " * depth
+                marker = "📂" if label_name == tree.root_label else "↳"
+                sid = node.session_id[:12] + "…" if node.session_id else "—"
+                fork = f" (fork of {node.parent_label})" if node.parent_session_id else ""
+                tree_lines.append(f"  {indent}{marker} {label_name}: {sid}{fork}")
+            tree_display = "\n".join(tree_lines)
+        else:
+            tree_display = "  (no sessions yet — run %%hermes to create one)"
+
+        acp = AcpConnection.get()
+        acp_sid = "—"
+        if acp.is_initialized and acp.session_id:
+            acp_sid = acp.session_id[:12] + "…"
+
+        help_text = f"""
+╔══════════════════════════════════════════════════════════════════╗
+║  jupyter-ai-hermes-magics v{__version__}                          ║
+╚══════════════════════════════════════════════════════════════════╝
+
+─── CELL MAGIC: %%hermes ───────────────────────────────────────────
+
+Talk to Hermes Agent directly inside a notebook cell.  Hermes can read
+your notebook, add/run cells, and answer questions with full context.
+
+USAGE:
+    %%hermes [options]
+    <your prompt here>
+
+FLAGS:
+    --label NAME, -l NAME   Session label (dot-notation for tree).
+                            Default: "main" (or the most recently used).
+    --new                   Force a fresh session even if the label
+                            already exists.  Parent history is prepended
+                            (fork semantics).
+    --no-context            Skip injecting notebook cells into the
+                            prompt.  Hermes can still read them via MCP.
+    --version               Print version and exit.
+
+EXAMPLES:
+    %%hermes
+    Explain what the code above does.
+
+    %%hermes --label main.explain
+    Why is this function returning None?
+
+    %%hermes --label main.fix --new
+    Rewrite the function to return a DataFrame instead.
+
+    %%hermes --no-context
+    What is the difference between list and tuple in Python?
+
+VARIABLE INTERPOLATION:
+    {{variable}} in the prompt is replaced with the kernel namespace
+    value, e.g.  "Summarise {{df}}" injects the DataFrame's repr.
+
+─── LINE MAGIC: %hermes ─────────────────────────────────────────────
+
+SUBCOMMANDS:
+    %hermes help        Show this help.
+    %hermes list        Show the session tree and ACP status.
+    %hermes reset       Clear all sessions and restart ACP.
+    %hermes version     Print the installed version.
+
+─── SESSION MODEL ───────────────────────────────────────────────────
+
+Each notebook kernel spawns one persistent `hermes acp` subprocess.
+The first %%hermes call creates session "main" (root).  All subsequent
+calls without --label auto-resume "main" — conversation accumulates.
+
+Labels create a FORK TREE:
+    main              — root session (fresh)
+    main.explain      — child: inherits main's history at creation
+    main.explain.fix  — grandchild of main.explain
+    main.test         — sibling of main.explain (forks from main)
+
+Each fork prepends the parent's last 10 messages as context.  Labels
+and session IDs are stored in notebook metadata and survive kernel
+restarts.  Use --new to start a fresh session on an existing label.
+
+NOTE: Multi-session ACP wiring is planned.  Currently all calls share
+a single ACP session; --label/--new manage the SessionTree metadata
+and fork context injection, but the underlying session is shared.
+
+─── CONTEXT INJECTION ───────────────────────────────────────────────
+
+By default, all notebook cells UP TO AND INCLUDING the %%hermes cell
+are injected into the prompt (truncated to 2000 chars each).  Cells
+below the magic cell are excluded but remain readable by Hermes via
+MCP tools (read_notebook_cells, get_active_cell_id, etc.).
+
+─── CURRENT STATUS ──────────────────────────────────────────────────
+
+ACP connection: {acp_sid}
+Session tree:
+{tree_display}
+"""
+        print(dedent(help_text).strip())
 
     def _list_sessions(self) -> None:
         tree = self._get_session_tree()
