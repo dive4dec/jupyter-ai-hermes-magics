@@ -250,7 +250,9 @@ class AcpConnection:
         self._thread: Optional[threading.Thread] = None
         self._proc: Optional[asyncio.subprocess.Process] = None
         self._conn = None  # ClientSideConnection
-        self._session_id: Optional[str] = None
+        self._session_id: Optional[str] = None  # default session (legacy)
+        self._sessions: dict[str, str] = {}  # label → session_id
+        self._active_session_id: Optional[str] = None  # during a prompt
         self._client: Optional[MagicAcpClient] = None
         self._initialized = False
         self._initializing = False
@@ -405,8 +407,52 @@ class AcpConnection:
             cwd=cwd, mcp_servers=[jupyter_mcp]
         )
         self._session_id = session.session_id
+        self._sessions["main"] = session.session_id
+        self._active_session_id = session.session_id
 
         logger.info("ACP initialized: session %s", self._session_id)
+
+    def new_session(self, label: str) -> str:
+        """Create a new ACP session for *label*.
+
+        Returns the new session_id.  Thread-safe — blocks until the
+        session is created.
+        """
+        if not self._initialized:
+            ok, msg = self.initialize()
+            if not ok:
+                raise RuntimeError(f"ACP not initialized: {msg}")
+
+        sid = self._run_async(self._async_new_session(), timeout=60)
+        self._sessions[label] = sid
+        logger.info("New ACP session for label %r: %s", label, sid)
+        return sid
+
+    async def _async_new_session(self) -> str:
+        """Create a new session on the existing ACP connection."""
+        cwd = os.getcwd()
+        mcp_url = os.environ.get(
+            "JUPYTER_MCP_URL", "http://localhost:3001/mcp"
+        )
+        from acp.schema import HttpMcpServer
+        jupyter_mcp = HttpMcpServer(
+            type="http",
+            name="jupyter",
+            url=mcp_url,
+            headers=[],
+        )
+        session = await self._conn.new_session(
+            cwd=cwd, mcp_servers=[jupyter_mcp]
+        )
+        return session.session_id
+
+    def get_session_id(self, label: str) -> Optional[str]:
+        """Return the session_id for *label*, or None if not created."""
+        return self._sessions.get(label)
+
+    def has_session(self, label: str) -> bool:
+        """Check if a session exists for *label*."""
+        return label in self._sessions
 
     def prompt(
         self,
@@ -414,15 +460,23 @@ class AcpConnection:
         on_chunk: Callable[[str], None] | None = None,
         on_tool_call: Callable[[dict], None] | None = None,
         on_permission: Callable[[dict], None] | None = None,
+        session_id: str | None = None,
     ) -> tuple[str, str]:
         """Send prompt to Hermes. Returns (response_text, stop_reason).
 
         Callbacks are called from the background asyncio thread.
+        If session_id is None, uses the default (first) session.
         """
         if not self._initialized:
             ok, msg = self.initialize()
             if not ok:
                 raise RuntimeError(f"ACP not initialized: {msg}")
+
+        # Resolve which session to prompt
+        sid = session_id or self._session_id
+        if sid is None:
+            raise RuntimeError("No ACP session available")
+        self._active_session_id = sid
 
         if self._prompt_in_progress:
             raise RuntimeError("A prompt is already in progress")
@@ -454,18 +508,21 @@ class AcpConnection:
 
         response = await self._conn.prompt(
             prompt=[TextContentBlock(text=text, type="text")],
-            session_id=self._session_id,
+            session_id=self._active_session_id or self._session_id,
         )
         return response
 
     def cancel(self):
         """Cancel the current prompt."""
-        if not self._prompt_in_progress or not self._conn or not self._session_id:
+        if not self._prompt_in_progress or not self._conn:
+            return
+        sid = self._active_session_id or self._session_id
+        if sid is None:
             return
         self._cancel_event.set()
         try:
             self._run_async(
-                self._conn.cancel(self._session_id), timeout=10
+                self._conn.cancel(sid), timeout=10
             )
         except Exception as e:
             logger.debug("Cancel failed: %s", e)
@@ -478,6 +535,16 @@ class AcpConnection:
     @property
     def session_id(self) -> Optional[str]:
         return self._session_id
+
+    @property
+    def active_session_id(self) -> Optional[str]:
+        """Session ID currently being prompted (or most recent)."""
+        return self._active_session_id
+
+    @property
+    def sessions(self) -> dict[str, str]:
+        """All known sessions: label → session_id."""
+        return dict(self._sessions)
 
     @property
     def is_initialized(self) -> bool:
@@ -497,6 +564,8 @@ class AcpConnection:
                 pass
         self._initialized = False
         self._session_id = None
+        self._sessions.clear()
+        self._active_session_id = None
         self._conn = None
         self._client = None
         self._proc = None

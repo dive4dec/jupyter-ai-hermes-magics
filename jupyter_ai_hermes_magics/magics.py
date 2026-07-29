@@ -296,6 +296,10 @@ def _start_hermes(
     prompt_text = state.get("prompt", "")
     exec_count = state.get("exec_count", 0)
     magic_cell_id = state.get("magic_cell_id")
+    is_new = state.get("is_new", False)
+    session_label = state.get("label", "main")
+    tree = state.get("tree")
+    node = state.get("node")
 
     # Get ACP connection
     acp = AcpConnection.get()
@@ -306,6 +310,25 @@ def _start_hermes(
         ok, msg = acp.initialize()
         if not ok:
             _set_button_state(button, label, "error", f"ACP init failed: {msg}")
+            return
+
+    # ── Resolve session ──
+    # Create a new ACP session if:
+    #   - is_new flag is set (--new), or
+    #   - the label has no ACP session yet (first use), or
+    #   - the label's stored session_id is stale (kernel restart)
+    # Otherwise resume the existing session.
+    acp_sid = acp.get_session_id(session_label) if acp.has_session(session_label) else None
+
+    if is_new or acp_sid is None:
+        try:
+            acp_sid = acp.new_session(session_label)
+            # Persist in notebook metadata
+            if tree is not None and node is not None:
+                tree.update_session_id(session_label, acp_sid)
+            logger.info("Created new ACP session %s for label %r", acp_sid, session_label)
+        except Exception as e:
+            _set_button_state(button, label, "error", f"Session creation failed: {e}")
             return
 
     # Set up streaming state
@@ -364,6 +387,7 @@ def _start_hermes(
                 on_chunk=_on_chunk,
                 on_tool_call=_on_tool_call,
                 on_permission=_on_permission,
+                session_id=acp_sid,
             )
             stop_timer.set()
             timer_thread.join(timeout=2)
@@ -735,10 +759,12 @@ class HermesMagics(Magics):
 
         # Print session info
         acp = AcpConnection.get()
-        if acp.is_initialized:
-            sid = acp.session_id or "—"
-            sid_short = sid[:12] + "…" if len(sid) > 12 else sid
+        existing_sid = acp.get_session_id(label) if acp.has_session(label) else None
+        if existing_sid and not is_new:
+            sid_short = existing_sid[:12] + "…" if len(existing_sid) > 12 else existing_sid
             print(f"↻ Session: {label} (ACP: {sid_short})")
+        elif is_new:
+            print(f"🌿 Fork/new: {label} (will create on click)")
         else:
             print(f"🔴 New session: {label} (ACP will start on first use)")
 
@@ -851,9 +877,9 @@ Each fork prepends the parent's last 10 messages as context.  Labels
 and session IDs are stored in notebook metadata and survive kernel
 restarts.  Use --new to start a fresh session on an existing label.
 
-NOTE: Multi-session ACP wiring is planned.  Currently all calls share
-a single ACP session; --label/--new manage the SessionTree metadata
-and fork context injection, but the underlying session is shared.
+After a kernel restart, stored session IDs become stale (the ACP
+subprocess was killed).  The next %%hermes on that label automatically
+creates a fresh session — no manual intervention needed.
 
 ─── CONTEXT INJECTION ───────────────────────────────────────────────
 
@@ -878,11 +904,12 @@ Session tree:
             return
 
         acp = AcpConnection.get()
-        acp_sid = "—"
-        if acp.is_initialized and acp.session_id:
-            acp_sid = acp.session_id[:12] + "…"
+        acp_sessions = acp.sessions if acp.is_initialized else {}
+        active_sid = acp.active_session_id
+        active_short = active_sid[:12] + "…" if active_sid else None
 
-        print(f"ACP session: {acp_sid}")
+        print(f"ACP active: {active_short if active_sid else '—'}")
+        print(f"ACP sessions: {len(acp_sessions)}")
         print("Session tree:")
         for label_name in labels:
             node = tree.get(label_name)
@@ -890,9 +917,14 @@ Session tree:
                 continue
             indent = "  " * (label_name.count(".") if label_name != tree.root_label else 0)
             marker = "📂" if label_name == tree.root_label else "↳"
-            sid = node.session_id[:12] + "…" if node.session_id else "—"
+            # Show the ACP session ID (live) if available, else the stored one
+            live_sid = acp_sessions.get(label_name)
+            sid = (live_sid or node.session_id or None)
+            sid_short = sid[:12] + "…" if sid else "—"
+            stale = " ⚠️stale" if node.session_id and not live_sid else ""
             fork = f" (fork of {node.parent_label})" if node.parent_session_id else ""
-            print(f"  {indent}{marker} {label_name}: {sid}{fork}")
+            active_mark = " ← active" if (active_sid and live_sid == active_sid) else ""
+            print(f"  {indent}{marker} {label_name}: {sid_short}{fork}{stale}{active_mark}")
 
 
 class _FormatDict(dict):
