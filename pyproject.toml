@@ -1,0 +1,33 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "jupyter-ai-hermes-magics"
+version = "0.4.0"
+description = "%%hermes cell magic — talk to Hermes Agent directly inside Jupyter notebooks"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+authors = [{ name = "Chung Chan", email = "ccha23@cityu.edu.hk" }]
+keywords = ["jupyter", "hermes", "ai", "magic", "cell-magic"]
+classifiers = [
+    "Framework :: IPython",
+    "Framework :: Jupyter",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+]
+dependencies = [
+    "ipython>=8.0",
+    "nbformat>=5.0",
+]
+
+[project.optional-dependencies]
+mcp = ["mcp>=1.0"]
+test = ["pytest>=7.0", "pytest-asyncio>=0.21"]
+
+[project.entry-points."IPython.core.magic_actions"]
+hermes = "jupyter_ai_hermes_magics.magics:HermesMagics"
+
+[tool.hatch.build.targets.wheel]
+packages = ["jupyter_ai_hermes_magics"]
