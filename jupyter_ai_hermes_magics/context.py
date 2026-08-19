@@ -189,14 +189,64 @@ def _mcp_initialize() -> bool:
     return _mcp_ensure_session()
 
 
-def gather_context() -> str:
-    """Gather notebook context synchronously via direct MCP HTTP calls.
+# Per-cell preview length in the notebook outline. Cells longer than this are
+# elided; Hermes fetches the full source on demand via `read_notebook_cells`.
+_OUTLINE_PREVIEW = 100
+
+
+def _outline_line(cell: dict, index: int, is_active: bool) -> str:
+    """Render a single cell as a compact one-line outline entry.
+
+    Format: ``[index] <type>  id=<cell_id>  exec=<n>  | <preview>``
+    """
+    cell_type = cell.get("cellType", "code")
+    source = cell.get("source", "") or ""
+    cell_id = cell.get("cell_id", "")
+    exec_count = cell.get("execution_count")
+
+    # Collapse all whitespace to a single line for the preview.
+    preview = " ".join(source.split())
+    if len(preview) > _OUTLINE_PREVIEW:
+        preview = preview[:_OUTLINE_PREVIEW].rstrip() + " …"
+
+    line = f"[{index}] {cell_type}"
+    if cell_id:
+        line += f"  id={cell_id}"
+    if exec_count is not None:
+        line += f"  exec={exec_count}"
+    if is_active:
+        line += "  <- ACTIVE (this %%hermes cell)"
+    if preview:
+        line += f"  | {preview}"
+    return line
+
+
+def gather_context(magic_cell_id: str | None = None) -> str:
+    """Gather a *lightweight* notebook outline (NOT full cell text).
+
+    Args:
+        magic_cell_id: The cell ID of the cell that *actually contains* the
+            ``%%hermes`` magic, captured from IPython parent metadata at magic
+            execution time. This is the **primary anchor** for the outline:
+            the outline covers cells up to and including this cell, and it is
+            marked ACTIVE.
+
+            This is more reliable than the server's "active cell" (your cursor
+            focus), which may point at a different cell. If ``magic_cell_id``
+            is missing or not found in the notebook, we fall back to
+            ``get_active_cell_id()``.
 
     Returns a formatted string containing:
       - Active notebook path
-      - Active cell ID
-      - **Cells up to and including the active cell** (so "the code above"
-        refers to cells before the ``%%hermes`` cell, not cells below it)
+      - The magic cell ID (anchor)
+      - A **one-line outline** of the cells up to and including the magic
+        cell: index, type, cell_id, exec count, and a short preview.
+
+    The full cell source is deliberately NOT inlined. Hermes has the Jupyter
+    MCP server available in its ACP session and fetches any specific cell on
+    demand via ``read_notebook_cells`` (with ``specific_cell_id``). This keeps
+    the prompt at a few hundred tokens regardless of how many cells — or how
+    large — the notebook is.
 
     Falls back to kernel introspection if MCP server is unavailable.
     """
@@ -216,65 +266,53 @@ def gather_context() -> str:
     active_nb = active_nb.strip().strip('"')
     parts.append(f"Active notebook: {active_nb}")
 
-    # 3. Active cell ID
-    active_cell_id = _mcp_call("get_active_cell_id", notebook_path=active_nb)
-    if active_cell_id:
-        active_cell_id = active_cell_id.strip().strip('"')
-        parts.append(f"Active cell ID: {active_cell_id}")
-    else:
-        active_cell_id = None
+    # 3. Anchor cell ID — prefer the real magic cell (from IPython parent
+    #    metadata); fall back to the server's "active cell" (cursor focus).
+    anchor_cell_id = (magic_cell_id or "").strip() or None
+    if not anchor_cell_id:
+        ui_active = _mcp_call("get_active_cell_id", notebook_path=active_nb)
+        if ui_active:
+            anchor_cell_id = ui_active.strip().strip('"') or None
+    parts.append(f"Magic cell ID: {anchor_cell_id}")
 
-    # 4. Read cells — only up to and including the active cell
+    # 4. Read cells -> build a one-line outline (NOT full source)
     cells_raw = _mcp_call("read_notebook_cells", notebook_path=active_nb)
     if cells_raw:
         try:
             cells = json.loads(cells_raw)
             if cells and isinstance(cells, list):
-                # Find the active cell index
+                # Find the anchor (magic) cell index
                 active_index = None
-                if active_cell_id:
+                if anchor_cell_id:
                     for i, cell in enumerate(cells):
-                        if cell.get("cell_id") == active_cell_id:
+                        if cell.get("cell_id") == anchor_cell_id:
                             active_index = i
                             break
 
-                # Only include cells up to and including the active cell.
+                # Only outline cells up to and including the active cell.
                 # Cells BELOW the magic cell are irrelevant for "explain the
-                # code above" — including them causes Hermes to explain
-                # unrelated code below the question.
+                # code above" — and outlining them would add noise.
                 if active_index is not None:
-                    visible_cells = cells[:active_index + 1]
+                    visible = list(range(active_index + 1))
                 else:
-                    # Can't find active cell — show all (shouldn't happen)
-                    visible_cells = cells
+                    visible = list(range(len(cells)))
 
-                parts.append(f"\nNotebook cells ({len(visible_cells)} shown"
-                             f"{f', out of {len(cells)} total' if active_index is not None else ''}):")
-                for i, cell in enumerate(visible_cells):
-                    cell_type = cell.get("cellType", "code")
-                    source = cell.get("source", "")
-                    cell_id = cell.get("cell_id", "")
-                    exec_count = cell.get("execution_count")
+                header = f"\nNotebook outline ({len(visible)} cell(s) at/above the magic cell"
+                if active_index is not None:
+                    header += f", of {len(cells)} total"
+                header += "):"
+                parts.append(header)
+                for i in visible:
+                    parts.append(_outline_line(cells[i], i, i == active_index))
 
-                    # Truncate very long cells
-                    max_len = 2000
-                    truncated = ""
-                    if len(source) > max_len:
-                        truncated = f" …({len(source)} chars, truncated)"
-                        source = source[:max_len]
-
-                    # Build cell marker
-                    marker = f"[Cell {i}]"
-                    if exec_count is not None:
-                        marker += f" (exec={exec_count})"
-                    marker += f" {cell_type}"
-                    if cell_id == active_cell_id:
-                        marker += " <- ACTIVE (this %%hermes cell)"
-                    parts.append(f"\n{marker}:")
-                    fence = "python" if cell_type == "code" else ""
-                    parts.append(f"```{fence}")
-                    parts.append(source)
-                    parts.append(f"```{truncated}")
+                # Tell Hermes how to fetch full content on demand.
+                parts.append(
+                    "\nFull cell source is NOT shown above (preview only). To read any "
+                    "cell's complete content, call the `read_notebook_cells` MCP tool "
+                    f"with `notebook_path=\"{active_nb}\"` and `specific_cell_id=<id>` "
+                    "(the `id=` value on the outline line you need). \"The cell above\" "
+                    "is the row with index (ACTIVE index - 1)."
+                )
         except (json.JSONDecodeError, TypeError) as e:
             logger.debug("Failed to parse cells JSON: %s", e)
 

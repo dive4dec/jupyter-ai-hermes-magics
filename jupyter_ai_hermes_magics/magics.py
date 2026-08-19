@@ -561,17 +561,79 @@ def _write_transcript_via_mcp(
 
 # ── Prompt construction ────────────────────────────────────────────────
 
-MCP_TOOLS_DOC = """## Jupyter MCP Tools (for editing cells if needed)
+# NOTE: these are invoked as NATIVE MCP tools on the Jupyter server
+# (registered at ACP session creation), NOT as a shell CLI. Tools are
+# addressed by name only (no `jupyter-mcp-cli` wrapper, no --arg syntax).
+#
+# Parameter convention (this is the #1 source of silent failures — state it
+# explicitly):
+#   • notebook_path : get_active_cell_id, read_notebook_cells
+#   • file_path     : read_notebook, read_cell, get_cell_id_from_index,
+#                     add_cell, insert_cell, edit_cell, delete_cell,
+#                     set_cell_metadata, get_cell_metadata, list_cell_tags,
+#                     get_notebook_info
+#   • cell_id       : run_cell (operates on the ACTIVE notebook)
+MCP_TOOLS_DOC = """## Jupyter MCP Tools
 
-You have Jupyter MCP tools available via the MCP server at localhost:3001.
-Key tools you can ask to use:
-- `read_notebook_cells` — Read all cells in a notebook
-- `add_cell` — Add a new cell (specify cell_type: code or markdown)
-- `edit_cell` — Edit an existing cell's content
-- `run_cell` — Execute a cell
+You have Jupyter MCP tools (served at localhost:3001). **Always use these
+instead of raw `nbformat`/file writes** — they apply collaboratively via YDoc
+(preserve cell tags/metadata, update the JupyterLab UI instantly).
 
-If the user asks you to create code, create cells, or edit the notebook,
-use these tools directly.
+Notebook cells were given to you as a **one-line outline** (index, type,
+cell `id`, short preview) — NOT full source. **Fetch full content on demand**
+before quoting or editing anything beyond the preview.
+
+### Reading context
+| Tool | Args | Purpose |
+|------|------|---------|
+| `get_open_documents` | — | List all open documents |
+| `get_active_notebook` | — | Active notebook path |
+| `get_active_cell_id` | `notebook_path` | Currently focused cell ID |
+| `read_notebook_cells` | `notebook_path`, optional `specific_cell_id` | All cells (JSON), or one cell |
+| `read_notebook` | `file_path` | Whole notebook as markdown |
+| `read_cell` | `file_path`, `cell_id` | One cell as markdown |
+| `get_cell_id_from_index` | `file_path`, `cell_index` | Resolve index → cell ID |
+
+### Editing cells
+| Tool | Args | Purpose |
+|------|------|---------|
+| `add_cell` | `file_path`, `cell_id`, `cell_type`, `content`, optional `add_above` | New cell above/below target |
+| `insert_cell` | `file_path`, `insert_index`, `cell_type`, `content` | Insert at index |
+| `edit_cell` | `file_path`, `cell_id`, `content` | Modify a cell's content |
+| `delete_cell` | `file_path`, `cell_id` | Delete a cell |
+
+### Running cells
+| Tool | Args | Purpose |
+|------|------|---------|
+| `run_cell` | `cell_id` | Execute one cell (active notebook) |
+| `run_all_cells` | — | Execute all cells |
+
+### Metadata, tags & navigation
+| Tool | Args | Purpose |
+|------|------|---------|
+| `set_cell_metadata` | `file_path`, `cell_id`, `metadata` (JSON object) | Set metadata, e.g. `{"slideshow":{"slide_type":"slide"}}` |
+| `get_cell_metadata` | `file_path`, `cell_id` | View metadata |
+| `list_cell_tags` | `file_path` | All tagged cells |
+| `select_cell` | `cell_id` | Move UI focus to a cell |
+| `open_file` | `file_path` | Open a file in JupyterLab |
+| `get_notebook_info` | `file_path` | Notebook format (jupytext) — check before editing |
+
+### JupyterLab commands (escape hatch)
+| Tool | Args | Purpose |
+|------|------|---------|
+| `list_all_commands` | optional `query` | Discover available Lab commands |
+| `execute_command` | `command_id`, optional `args` | Run a Lab command |
+
+### Cell-content conventions
+- Use **real newlines** in `content`, never literal `\\n`.
+- One logical idea per cell; `#`/`##`/`###` headers go in their own markdown cells.
+- Keep cells concise — prefer several small cells over one dense wall of text.
+- For jupytext `.py`/`.md` formats, check `get_notebook_info` first.
+
+**The correct pattern for "explain/edit the cell above":** it is the outline
+row with index = (ACTIVE index − 1). Call `read_notebook_cells` with
+`notebook_path="<active notebook path>"` and `specific_cell_id="<that row's
+id=>"` to fetch it, THEN act.
 """
 
 
@@ -665,11 +727,24 @@ class HermesMagics(Magics):
         node = tree.get_or_create(label)
         is_new = args.new or node.session_id is None
 
-        # Gather notebook context
+        # Capture the magic cell's ID directly from the kernel parent
+        # metadata.  JupyterLab sends cellId in the execute_request metadata;
+        # ipykernel stores it at parent["metadata"]["cellId"].  This is the
+        # reliable anchor for the context outline (the server's "active cell"
+        # = cursor focus may point at a different cell).
+        magic_cell_id = None
+        try:
+            parent = ip.get_parent()
+            if parent and "metadata" in parent:
+                magic_cell_id = parent["metadata"].get("cellId")
+        except Exception:
+            pass
+
+        # Gather notebook context (anchored on the real magic cell)
         context_text = ""
         if not args.no_context:
             try:
-                context_text = gather_context()
+                context_text = gather_context(magic_cell_id)
             except Exception as e:
                 logger.debug("Context gathering failed: %s", e)
                 context_text = ""
@@ -680,9 +755,11 @@ class HermesMagics(Magics):
         if context_text and context_text != "(No IPython kernel available)":
             full_prompt_parts.append(
                 "## Notebook Context\n\n"
-                "Below are the notebook cells **up to and including** the "
-                "user's `%%hermes` cell (marked ACTIVE). "
-                '"The code above" refers to the cells before the ACTIVE cell.\n\n'
+                "A one-line outline of the cells at/above the user's `%%hermes` "
+                "cell (marked ACTIVE) is below. Full source is NOT shown — "
+                "fetch any cell you need with the `read_notebook_cells` MCP "
+                "tool by its `id`. \"The code above\" = cells before the "
+                "ACTIVE cell.\n\n"
                 + context_text
             )
 
@@ -709,19 +786,8 @@ class HermesMagics(Magics):
         # ── Phase 1: Display the button ──
         exec_count = ip.execution_count
 
-        # Capture the magic cell's ID directly from the kernel parent
-        # metadata.  JupyterLab sends cellId in the execute_request metadata;
-        # ipykernel stores it at parent["metadata"]["cellId"].  This is far
-        # more reliable than matching by execution_count (which is off-by-one
-        # during cell magic execution, and can match cells Hermes creates).
-        magic_cell_id = None
-        try:
-            parent = ip.get_parent()
-            if parent and "metadata" in parent:
-                magic_cell_id = parent["metadata"].get("cellId")
-        except Exception:
-            pass
-
+        # (magic_cell_id was captured above, before context gathering, and is
+        #  reused here for the transcript cell.)
         hermes_state = {
             "prompt": full_prompt,
             "session_id": node.session_id if not is_new else None,
@@ -883,10 +949,12 @@ creates a fresh session — no manual intervention needed.
 
 ─── CONTEXT INJECTION ───────────────────────────────────────────────
 
-By default, all notebook cells UP TO AND INCLUDING the %%hermes cell
-are injected into the prompt (truncated to 2000 chars each).  Cells
-below the magic cell are excluded but remain readable by Hermes via
-MCP tools (read_notebook_cells, get_active_cell_id, etc.).
+By default, notebook cells UP TO AND INCLUDING the %%hermes cell are
+injected as a **one-line outline** (index, type, cell `id`, short preview)
+— NOT the full source. This keeps the prompt small even for large
+notebooks. Hermes fetches any cell's full content on demand via the
+`read_notebook_cells` MCP tool (by `cell_id`). Cells below the magic cell
+are not outlined at all.
 
 ─── CURRENT STATUS ──────────────────────────────────────────────────
 
@@ -946,7 +1014,7 @@ def _init_acp_background():
     acp = AcpConnection.get()
     if acp.is_initialized:
         sid = acp.session_id or ""
-        print(f"✓ Hermes ACP already connected (session {sid[:12]}…)")
+        logger.debug("Hermes ACP already connected (session %s…)", sid[:12])
         return
 
     # Check hermes binary exists before starting
@@ -960,14 +1028,14 @@ def _init_acp_background():
         )
         return
 
-    print("⟳ Hermes ACP: starting background connection…")
+    logger.debug("Hermes ACP: starting background connection…")
 
     def _worker():
         try:
             ok, msg = acp.initialize()
             if ok:
                 sid = acp.session_id or ""
-                print(f"✓ Hermes ACP connected (session {sid[:12]}…)")
+                logger.debug("Hermes ACP connected (session %s…)", sid[:12])
             else:
                 print(
                     f"✗ Hermes ACP init failed: {msg}\n"
