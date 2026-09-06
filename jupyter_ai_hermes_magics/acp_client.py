@@ -260,6 +260,11 @@ class AcpConnection:
         self._init_lock = threading.Lock()
         self._prompt_in_progress = False
         self._cancel_event = threading.Event()
+        # WATCHDOG_MARKER_HERMES_WD — background task that drains the
+        # subprocess's stderr. Without it, once the OS stderr pipe buffer
+        # fills the hermes-acp process blocks in write(2) and the whole ACP
+        # channel wedges (see the redirect-failure post-mortem).
+        self._stderr_task = None
 
     @classmethod
     def get(cls) -> "AcpConnection":
@@ -364,6 +369,13 @@ class AcpConnection:
             limit=50 * 1024 * 1024,
             start_new_session=True,
         )
+
+        # WATCHDOG_MARKER_HERMES_WD — keep reading stderr so the pipe buffer
+        # never fills and blocks the subprocess (which would wedge ACP).
+        if self._proc.stderr is not None:
+            self._stderr_task = asyncio.get_event_loop().create_task(
+                self._drain_stderr(self._proc.stderr)
+            )
 
         # Create client + connect
         self._client = MagicAcpClient()
@@ -499,6 +511,16 @@ class AcpConnection:
             return self._client.get_accumulated_text(), response.stop_reason
         except Exception as e:
             logger.error("Prompt failed: %s", e, exc_info=True)
+            # A concurrent.futures timeout has an empty str() — surface a
+            # meaningful message. The turn may STILL be running server-side
+            # (see the turn-stall watchdog in hermes-agent); the magic layer
+            # handles the cancel + retry, so just report clearly.
+            if type(e).__name__ == "TimeoutError":
+                raise RuntimeError(
+                    "Hermes timed out after 300s. The turn may still be running "
+                    "server-side. Run %hermes reset (or restart the kernel) and "
+                    "try again."
+                ) from e
             raise
         finally:
             self._prompt_in_progress = False
@@ -511,6 +533,42 @@ class AcpConnection:
             session_id=self._active_session_id or self._session_id,
         )
         return response
+
+    def cancel_server_turn(self) -> None:
+        """Force-stop the SERVER-side ACP turn without tearing down the connection.
+
+        WATCHDOG_MARKER_HERMES_WD — used by the %%hermes magic's redirect
+        recovery. ``cancel()`` only signals when a client-side prompt is in
+        progress; this sends the ACP ``cancel`` RPC for the active session so
+        the server's stuck turn (is_running stuck True) is interrupted via its
+        own cancel path. Safe to call when nothing is in progress — the server
+        ignores a cancel for an idle session.
+        """
+        if not self._conn:
+            return
+        sid = self._active_session_id or self._session_id
+        if sid is None:
+            return
+        try:
+            self._run_async(self._conn.cancel(sid), timeout=10)
+        except Exception as e:
+            logger.debug("cancel_server_turn failed: %s", e)
+
+    async def _drain_stderr(self, stream) -> None:
+        """WATCHDOG_MARKER_HERMES_WD — consume subprocess stderr so the pipe
+        buffer can never fill and block hermes-acp. Logged at DEBUG."""
+        try:
+            while True:
+                line = await stream.readline()
+                if not line:
+                    break
+                text = line.decode("utf-8", errors="replace").rstrip()
+                if text:
+                    logger.debug("[hermes acp] %s", text)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.debug("stderr drain stopped", exc_info=True)
 
     def cancel(self):
         """Cancel the current prompt."""
@@ -552,6 +610,13 @@ class AcpConnection:
 
     def _shutdown(self):
         """Kill subprocess, stop loop."""
+        # WATCHDOG_MARKER_HERMES_WD — stop the stderr drain before killing.
+        if self._stderr_task is not None:
+            try:
+                self._stderr_task.cancel()
+            except Exception:
+                pass
+            self._stderr_task = None
         if self._proc and self._proc.returncode is None:
             try:
                 self._proc.kill()

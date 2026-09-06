@@ -3,6 +3,45 @@
 All notable changes to `jupyter-ai-hermes-magics` are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.5.2] — 2026-09-07
+
+### Fixed
+- **Dark-theme readability of the streaming output.** The live "thinking"
+  response box used a fixed light background (`#f8f8f8`) with no text colour,
+  so under JupyterLab's dark theme the (light) inherited text sat on a light
+  box and was effectively invisible. The box now uses JupyterLab's theme
+  tokens — `--jp-layout-color1` (surface), `--jp-content-font-color1` (text),
+  `--jp-border-color1` (border) — so it adapts to Light *and* Dark. The
+  "Tool calls (N)" summary and the per-tool rows likewise moved from
+  hardcoded `#666`/`#555` to `--jp-content-font-color2`. Every token carries a
+  hex fallback, so the text can never render invisible again. Verified by
+  rendering the actual output under both themes.
+
+## [0.5.1] — 2026-09-07
+
+### Fixed
+- **"Redirected the active turn with your correction." no longer appears as a
+  notebook answer.** When a `%%hermes` prompt arrived while the previous turn
+  was still wedged (hung LLM stream / stuck approval), the ACP server folded
+  it in as a "correction" and replied with that ack instead of an answer — and
+  the ack was then written into the cell as the "result". The magic now
+  detects the redirect ack, interrupts the stuck server turn, clears the
+  partial output, and retries the prompt once; a second ack raises an
+  actionable "session still wedged, run `%hermes reset`" error instead of a
+  bogus transcript.
+- **ACP channel wedge from a full stderr pipe.** The `hermes acp` subprocess's
+  stderr was never drained, so once the OS pipe buffer filled the process
+  blocked on `write(2)` and the whole ACP channel hung. A background task now
+  drains stderr (logged at DEBUG) for the life of the connection.
+- **Meaningful 300 s timeout.** A client-side prompt timeout now raises a
+  clear "timed out after 300 s — the turn may still be running server-side,
+  run `%hermes reset`" message instead of an empty `TimeoutError` string.
+
+### Added
+- **`acp_client.cancel_server_turn()`** — sends the ACP `cancel` RPC for the
+  active session to stop a server-side stuck turn without tearing down the
+  connection (used by the redirect recovery above).
+
 ## [0.5.0] — 2026-08-19
 
 ### Changed

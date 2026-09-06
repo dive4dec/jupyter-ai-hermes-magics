@@ -194,13 +194,18 @@ def _build_streaming_html(
                 "completed": "✓", "failed": "✗",
             }.get(tc.get("status", ""), "⚙️")
             title = html.escape(tc.get("title", "tool"))
+            # Secondary text colour from JupyterLab tokens (readable on both
+            # Light and Dark). The old hardcoded #555 was tuned for a light
+            # surface and read as dark-grey-on-dark under the dark theme.
             items.append(
-                f'<div style="margin:2px 0;font-size:0.85em;color:#555;">'
+                f'<div style="margin:2px 0;font-size:0.85em;'
+                f'color:var(--jp-content-font-color2, #b8b8b8);">'
                 f'{icon} {status_icon} {title}</div>'
             )
         details_html = (
             '<details style="margin-top:4px;">'
-            '<summary style="cursor:pointer;color:#666;font-size:0.8em;">'
+            '<summary style="cursor:pointer;'
+            'color:var(--jp-content-font-color2, #b8b8b8);font-size:0.8em;">'
             f'Tool calls ({len(tool_calls)})</summary>'
             '<div style="margin:4px 0;padding-left:12px;">'
             + "\n".join(items) +
@@ -209,12 +214,21 @@ def _build_streaming_html(
         parts.append(details_html)
 
     # Response text
+    # Theme-aware panel: use JupyterLab's own CSS tokens so the background and
+    # text colour track the active Light/Dark theme. The previous version set a
+    # fixed light background (#f8f8f8) with no text colour, so under the dark
+    # theme the (light) inherited text sat on a light box and was unreadable.
+    # The hex fallbacks are a readable dark surface + light text, so even in a
+    # context where the tokens are undefined the text can never go invisible.
     full_text = "".join(text_chunks)
     if full_text:
         escaped = html.escape(full_text)
         parts.append(
-            f'<div style="margin-top:4px;padding:4px 8px;'
-            f'background:#f8f8f8;border-radius:4px;'
+            f'<div style="margin-top:4px;padding:6px 10px;'
+            f'background:var(--jp-layout-color1, #262626);'
+            f'color:var(--jp-content-font-color1, #e6e6e6);'
+            f'border:1px solid var(--jp-border-color1, #444);'
+            f'border-radius:4px;'
             f'white-space:pre-wrap;font-size:0.9em;">{escaped}</div>'
         )
 
@@ -380,6 +394,13 @@ def _start_hermes(
 
     # ── Run prompt in background thread ──
 
+    # WATCHDOG_MARKER_HERMES_WD — the ACP server's "active-turn redirect" ack.
+    # If a prompt arrives while a previous turn is still is_running, the server
+    # folds it in as a "correction" and immediately replies with this string
+    # (it does NOT execute the prompt). Historically this ack was written into
+    # the notebook as the "answer", which is the "%%hermes is broken" symptom.
+    REDIRECT_ACK_PREFIX = "Redirected the active turn with your correction."
+
     def _worker():
         try:
             response_text, stop_reason = acp.prompt(
@@ -395,6 +416,52 @@ def _start_hermes(
             if stop_reason == "cancelled":
                 _finalize(display_handle, "stopped")
                 return
+
+            # ── Redirect-ack recovery ────────────────────────────────────
+            # A prompt arrived while a previous turn never finished (wedged in
+            # a hung LLM stream / stuck approval). The server swallowed it and
+            # acked instead of answering. Interrupt the stuck server turn and
+            # retry the prompt ONCE. A second ack means the session is still
+            # wedged — surface an actionable error, never a bogus transcript.
+            if response_text is not None and response_text.startswith(REDIRECT_ACK_PREFIX):
+                logger.warning(
+                    "%%hermes got a redirect ack — previous turn appears wedged; "
+                    "interrupting the server turn and retrying once."
+                )
+                try:
+                    acp.cancel_server_turn()
+                except Exception as ce:
+                    logger.debug("cancel_server_turn during recovery failed: %s", ce)
+                time.sleep(3)  # let the interrupted turn unwind
+                # Reset local accumulation + widget so the ack text cannot leak
+                # into the retry's transcript cell.
+                text_chunks.clear()
+                tool_calls.clear()
+                try:
+                    output_html.value = ""
+                except Exception:
+                    pass
+                response_text, stop_reason = acp.prompt(
+                    prompt_text,
+                    on_chunk=_on_chunk,
+                    on_tool_call=_on_tool_call,
+                    on_permission=_on_permission,
+                    session_id=acp_sid,
+                )
+                stop_timer.set()
+                timer_thread.join(timeout=2)
+
+                if stop_reason == "cancelled":
+                    _finalize(display_handle, "stopped")
+                    return
+                if response_text is not None and response_text.startswith(REDIRECT_ACK_PREFIX):
+                    _finalize(
+                        display_handle, "error",
+                        "Hermes session is still stuck (a previous turn never "
+                        "finished). Run %hermes reset (or restart the kernel) "
+                        "and try again.",
+                    )
+                    return
 
             if not response_text:
                 _finalize(display_handle, "error", "Empty response from Hermes")

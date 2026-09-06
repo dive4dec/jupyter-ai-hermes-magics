@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "jupyter-ai-hermes-magics"
-version = "0.5.0"
+version = "0.5.2"
 description = "%%hermes cell magic — talk to Hermes Agent directly inside Jupyter notebooks"
 readme = "README.md"
 license = "MIT"
